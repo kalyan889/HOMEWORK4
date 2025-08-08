@@ -13,16 +13,60 @@ class MLPPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
+        hidden_dim: int = 128,
+        num_layers: int = 3,
+        dropout: float = 0.1,
     ):
         """
+        MLP-based planner that predicts waypoints from track boundaries.
+        
         Args:
             n_track (int): number of points in each side of the track
             n_waypoints (int): number of waypoints to predict
+            hidden_dim (int): dimension of hidden layers
+            num_layers (int): number of hidden layers
+            dropout (float): dropout probability
         """
         super().__init__()
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
+        
+        # Input dimension: left track (n_track * 2) + right track (n_track * 2)
+        input_dim = n_track * 2 * 2
+        
+        # Output dimension: waypoints (n_waypoints * 2)
+        output_dim = n_waypoints * 2
+        
+        # Build MLP layers
+        layers = []
+        
+        # Input layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout))
+        
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+        
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        
+        self.mlp = nn.Sequential(*layers)
+        
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights using Xavier initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(
         self,
@@ -43,7 +87,26 @@ class MLPPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        raise NotImplementedError
+        batch_size = track_left.shape[0]
+        
+        # Flatten and concatenate track boundaries
+        # track_left: (b, n_track, 2) -> (b, n_track * 2)
+        # track_right: (b, n_track, 2) -> (b, n_track * 2)
+        track_left_flat = track_left.reshape(batch_size, -1)
+        track_right_flat = track_right.reshape(batch_size, -1)
+        
+        # Concatenate left and right tracks
+        # Combined: (b, n_track * 2 * 2)
+        x = torch.cat([track_left_flat, track_right_flat], dim=-1)
+        
+        # Pass through MLP
+        # Output: (b, n_waypoints * 2)
+        output = self.mlp(x)
+        
+        # Reshape to (b, n_waypoints, 2)
+        waypoints = output.reshape(batch_size, self.n_waypoints, 2)
+        
+        return waypoints
 
 
 class TransformerPlanner(nn.Module):
