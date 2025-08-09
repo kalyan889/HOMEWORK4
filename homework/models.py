@@ -197,10 +197,77 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
+        # Small convolutional backbone
+        # Input image: (B, 3, 96, 128)
+        # Use a few conv blocks, then global average pool
+        self.backbone = nn.Sequential(
+            # conv block 1
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),  # -> 32 x 96 x 128
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # -> 32 x 48 x 64
+
+            # conv block 2
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # -> 64 x 48 x 64
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # -> 64 x 24 x 32
+
+            # conv block 3
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # -> 128 x 24 x 32
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # -> 128 x 12 x 16
+
+            # conv block 4
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),  # -> 256 x 12 x 16
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),  # -> 256 x 1 x 1
+        )
+
+        # Head: small MLP from features -> waypoints
+        feat_dim = 256
+        hidden_dim = 128
+        output_dim = n_waypoints * 2
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # initialize conv and linear layers sensibly
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        image: (B, 3, 96, 128)
+        returns: (B, n_waypoints, 2)
+        """
         x = image
+        # normalize using stored mean/std (broadcast)
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
-        raise NotImplementedError
+        features = self.backbone(x)  # (B, 256, 1, 1)
+        preds = self.head(features)  # (B, n_waypoints*2)
+        batch_size = preds.shape[0]
+        waypoints = preds.reshape(batch_size, self.n_waypoints, 2)
+        return waypoints
 
 
 MODEL_FACTORY = {
