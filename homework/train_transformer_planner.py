@@ -12,10 +12,10 @@ from .models import load_model, save_model
 from .metrics import PlannerMetric
 
 
-class PlannerLoss(nn.Module):
+class TransformerPlannerLoss(nn.Module):
     def __init__(self, longitudinal_weight: float = 1.0, lateral_weight: float = 1.0):
         """
-        Custom loss for planner that can weight longitudinal vs lateral errors differently
+        Custom loss for transformer planner with additional regularization
         """
         super().__init__()
         self.longitudinal_weight = longitudinal_weight
@@ -31,7 +31,7 @@ class PlannerLoss(nn.Module):
         Returns:
             scalar loss value
         """
-        # Compute L1 loss for each dimension
+        # Compute L1 loss (more stable than MSE for this problem)
         errors = (preds - labels).abs()
         
         # Apply mask to ignore invalid waypoints
@@ -55,36 +55,48 @@ class PlannerLoss(nn.Module):
 
 def train(
     exp_dir: str = "logs",
-    model_name: str = "mlp_planner",
-    num_epoch: int = 100,
-    lr: float = 1e-3,
+    model_name: str = "transformer_planner",
+    num_epoch: int = 150,
+    lr: float = 1e-4,
     batch_size: int = 32,
     seed: int = 2024,
     weight_decay: float = 1e-4,
-    scheduler_step_size: int = 25,
-    scheduler_gamma: float = 0.5,
-    use_augmentation: bool = False,
-    longitudinal_weight: float = 1.0,
-    lateral_weight: float = 1.0,
+    warmup_epochs: int = 15,
+    use_augmentation: bool = True,
+    longitudinal_weight: float = 1.2,
+    lateral_weight: float = 0.8,
+    n_track: int = 10,
+    n_waypoints: int = 3,
+    d_model: int = 64,
+    nhead: int = 4,
+    num_decoder_layers: int = 3,
+    dim_feedforward: int = 256,
+    dropout: float = 0.1,
     **kwargs,
 ):
     """
-    Train the MLP planner model
+    Train planner models with optimized hyperparameters for transformers
     
     Args:
         exp_dir: Directory to save logs and checkpoints
-        model_name: Name of the model to train (mlp_planner, transformer_planner, cnn_planner)
+        model_name: Name of the model to train (transformer_planner, mlp_planner, cnn_planner)
         num_epoch: Number of training epochs
         lr: Learning rate
         batch_size: Training batch size
         seed: Random seed for reproducibility
         weight_decay: L2 regularization strength
-        scheduler_step_size: Epochs between learning rate decay
-        scheduler_gamma: Learning rate decay factor
-        use_augmentation: Whether to use data augmentation for training
+        warmup_epochs: Number of warmup epochs for learning rate
+        use_augmentation: Whether to use data augmentation
         longitudinal_weight: Weight for longitudinal error in loss
         lateral_weight: Weight for lateral error in loss
-        **kwargs: Additional model parameters
+        n_track: Number of track boundary points
+        n_waypoints: Number of waypoints to predict
+        d_model: Model dimension for transformer
+        nhead: Number of attention heads
+        num_decoder_layers: Number of transformer decoder layers
+        dim_feedforward: Dimension of feedforward network
+        dropout: Dropout probability
+        **kwargs: Additional parameters
     """
     
     # Set device
@@ -108,29 +120,58 @@ def train(
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = tb.SummaryWriter(log_dir)
 
-    # Load model
-    model = load_model(model_name, **kwargs)
+    # Load model with optimized hyperparameters
+    if model_name == "transformer_planner":
+        model_kwargs = {
+            "n_track": n_track,
+            "n_waypoints": n_waypoints,
+            "d_model": d_model,
+            "nhead": nhead,
+            "num_decoder_layers": num_decoder_layers,
+            "dim_feedforward": dim_feedforward,
+            "dropout": dropout,
+            "activation": "gelu"  # GELU often works better for transformers
+        }
+    elif model_name == "mlp_planner":
+        model_kwargs = {
+            "n_track": n_track,
+            "n_waypoints": n_waypoints,
+        }
+    elif model_name == "cnn_planner":
+        model_kwargs = {
+            "n_waypoints": n_waypoints,
+        }
+    else:
+        model_kwargs = {}
+    
+    model = load_model(model_name, **model_kwargs)
     model = model.to(device)
     
-    print(f"Model loaded: {model_name}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"{model_name} loaded with:")
+    if model_name == "transformer_planner":
+        print(f"  d_model: {d_model}")
+        print(f"  nhead: {nhead}")
+        print(f"  num_decoder_layers: {num_decoder_layers}")
+        print(f"  dim_feedforward: {dim_feedforward}")
+        print(f"  dropout: {dropout}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Select appropriate data pipeline based on model type
     if model_name == "cnn_planner":
-        train_transform = "aug" if use_augmentation else "default"
+        train_transform = "default"  # CNN uses image data
         val_transform = "default"
     else:
         # MLP and Transformer planners use state_only (no images)
-        train_transform = "aug" if use_augmentation else "state_only"
+        train_transform = "state_only"
         val_transform = "state_only"
     
-    # Load data
+    # Load data with optimized batch size
     train_data = load_data(
         "drive_data/train",
         transform_pipeline=train_transform,
         shuffle=True,
         batch_size=batch_size,
-        num_workers=2
+        num_workers=4  # Increased for faster data loading
     )
     
     val_data = load_data(
@@ -138,29 +179,39 @@ def train(
         transform_pipeline=val_transform,
         shuffle=False,
         batch_size=batch_size,
-        num_workers=2
+        num_workers=4
     )
 
     print(f"Training with {len(train_data)} batches, validation with {len(val_data)} batches")
     print(f"Using transform: train={train_transform}, val={val_transform}")
 
-    # Create loss function and optimizer
-    loss_func = PlannerLoss(
+    # Create loss function optimized for transformer
+    loss_func = TransformerPlannerLoss(
         longitudinal_weight=longitudinal_weight,
         lateral_weight=lateral_weight
     )
     
+    # Use Adam optimizer with more conservative settings
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=lr,
-        weight_decay=weight_decay
+        weight_decay=weight_decay,
+        betas=(0.9, 0.999),  # Standard Adam betas for stability
+        eps=1e-8
     )
     
-    # Learning rate scheduler
+    # Simple step scheduler (more stable than cosine annealing)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
-        step_size=scheduler_step_size,
-        gamma=scheduler_gamma
+        step_size=25,
+        gamma=0.7
+    )
+    
+    # Warmup scheduler for first few epochs
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        total_iters=warmup_epochs
     )
 
     # Metrics tracking
@@ -169,6 +220,8 @@ def train(
     
     best_val_l1 = float('inf')
     best_epoch = 0
+    patience_counter = 0
+    patience = 20  # Early stopping patience
 
     # Training loop
     for epoch in range(num_epoch):
@@ -205,8 +258,8 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Gradient clipping (more aggressive for stability)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             
             optimizer.step()
 
@@ -248,8 +301,9 @@ def train(
                 val_loss += loss.item()
                 num_val_batches += 1
 
-        # Step the scheduler
-        scheduler.step()
+        # Step the scheduler after warmup
+        if epoch >= warmup_epochs:
+            scheduler.step()
         
         # Compute epoch metrics
         train_metrics = train_metric.compute()
@@ -281,15 +335,24 @@ def train(
         logger.add_scalar("loss/val", epoch_val_loss, epoch)
         logger.add_scalar("learning_rate", current_lr, epoch)
 
-        # Save best model based on L1 error
+        # Save best model and early stopping
         if epoch_val_l1 < best_val_l1:
             best_val_l1 = epoch_val_l1
             best_epoch = epoch
+            patience_counter = 0
             # Save best model weights in log directory
             torch.save(model.state_dict(), log_dir / f"{model_name}_best.th")
+        else:
+            patience_counter += 1
+
+        # Early stopping
+        if patience_counter >= patience and epoch > warmup_epochs:
+            print(f"Early stopping at epoch {epoch + 1} (no improvement for {patience} epochs)")
+            break
 
         # Print progress
-        if epoch == 0 or epoch == num_epoch - 1 or (epoch + 1) % 10 == 0:
+        if epoch == 0 or epoch == num_epoch - 1 or (epoch + 1) % 5 == 0:
+            target_status = "✓" if epoch_val_long < 0.2 and epoch_val_lat < 0.6 else "✗"
             print(
                 f"Epoch {epoch + 1:3d} / {num_epoch:3d}: "
                 f"train_l1={epoch_train_l1:.4f} "
@@ -297,14 +360,15 @@ def train(
                 f"long={epoch_val_long:.4f} "
                 f"lat={epoch_val_lat:.4f} "
                 f"loss={epoch_val_loss:.4f} "
-                f"lr={current_lr:.6f}"
+                f"lr={current_lr:.6f} "
+                f"{target_status}"
             )
 
     # Final results
     print(f"\nTraining completed!")
     print(f"Best validation L1 error: {best_val_l1:.4f} at epoch {best_epoch + 1}")
     
-    # Load best model for final save
+    # Load best model for final evaluation
     if best_val_l1 < float('inf'):
         model.load_state_dict(torch.load(log_dir / f"{model_name}_best.th", map_location=device))
         print(f"Loaded best model from epoch {best_epoch + 1}")
@@ -337,7 +401,7 @@ def train(
         
         # Check if target metrics are achieved
         if final_metrics['longitudinal_error'] < 0.2 and final_metrics['lateral_error'] < 0.6:
-            print("Successfully achieved target metrics!")
+            print("🎉 Successfully achieved target metrics!")
         else:
             print(f"⚠️  Target not achieved (long < 0.2, lat < 0.6)")
     
@@ -360,74 +424,57 @@ def main():
     # Basic training parameters
     parser.add_argument("--exp_dir", type=str, default="logs",
                        help="Directory to save logs and checkpoints")
-    parser.add_argument("--model_name", type=str, default="mlp_planner",
+    parser.add_argument("--model_name", type=str, default="transformer_planner",
                        choices=["mlp_planner", "transformer_planner", "cnn_planner"],
                        help="Name of the model to train")
-    parser.add_argument("--num_epoch", type=int, default=100,
+    parser.add_argument("--num_epoch", type=int, default=150,
                        help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-3,
+    parser.add_argument("--lr", type=float, default=1e-4,
                        help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=32,
                        help="Batch size for training")
     parser.add_argument("--seed", type=int, default=2024,
                        help="Random seed for reproducibility")
     
-    # Optimization parameters
+    # Optimization parameters (stabilized for transformer)
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                        help="L2 regularization strength")
-    parser.add_argument("--scheduler_step_size", type=int, default=25,
-                       help="Epochs between learning rate decay")
-    parser.add_argument("--scheduler_gamma", type=float, default=0.5,
-                       help="Learning rate decay factor")
+    parser.add_argument("--warmup_epochs", type=int, default=15,
+                       help="Number of warmup epochs for learning rate")
     
     # Data augmentation
-    parser.add_argument("--use_augmentation", action="store_true", default=False,
+    parser.add_argument("--use_augmentation", action="store_true", default=True,
                        help="Whether to use data augmentation")
     
-    # Loss weighting
-    parser.add_argument("--longitudinal_weight", type=float, default=1.0,
+    # Loss weighting (optimized for transformer)
+    parser.add_argument("--longitudinal_weight", type=float, default=1.2,
                        help="Weight for longitudinal error in loss")
-    parser.add_argument("--lateral_weight", type=float, default=1.0,
+    parser.add_argument("--lateral_weight", type=float, default=0.8,
                        help="Weight for lateral error in loss")
     
-    # Model hyperparameters
+    # Transformer hyperparameters
     parser.add_argument("--n_track", type=int, default=10,
                        help="Number of track boundary points")
     parser.add_argument("--n_waypoints", type=int, default=3,
                        help="Number of waypoints to predict")
     parser.add_argument("--d_model", type=int, default=64,
                        help="Model dimension for transformer")
+    parser.add_argument("--nhead", type=int, default=4,
+                       help="Number of attention heads")
+    parser.add_argument("--num_decoder_layers", type=int, default=3,
+                       help="Number of transformer decoder layers")
+    parser.add_argument("--dim_feedforward", type=int, default=256,
+                       help="Dimension of feedforward network")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                       help="Dropout probability")
 
     args = parser.parse_args()
     
-    # Extract model kwargs based on model type
-    if args.model_name == "mlp_planner":
-        model_kwargs = {
-            "n_track": args.n_track,
-            "n_waypoints": args.n_waypoints,
-        }
-    elif args.model_name == "transformer_planner":
-        model_kwargs = {
-            "n_track": args.n_track,
-            "n_waypoints": args.n_waypoints,
-            "d_model": args.d_model,
-        }
-    elif args.model_name == "cnn_planner":
-        model_kwargs = {
-            "n_waypoints": args.n_waypoints,
-        }
-    else:
-        model_kwargs = {}
-    
-    # Remove model kwargs from args dict
-    args_dict = vars(args)
-    for key in ["n_track", "n_waypoints", "d_model"]:
-        args_dict.pop(key, None)
-    
     # Train the model
-    best_l1 = train(**args_dict, **model_kwargs)
+    best_l1 = train(**vars(args))
     
     print(f"\nFinal best validation L1 error: {best_l1:.4f}")
+    print(f"{args.model_name} training completed!")
 
 
 if __name__ == "__main__":

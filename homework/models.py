@@ -110,21 +110,102 @@ class MLPPlanner(nn.Module):
 
 
 class TransformerPlanner(nn.Module):
+    """
+    Transformer-based planner using Perceiver-like architecture.
+    Uses learned waypoint query embeddings to attend over track boundary features.
+    """
+    
     def __init__(
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
         d_model: int = 64,
+        nhead: int = 8,
+        num_decoder_layers: int = 4,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        input_dim: int = 2,  # x, y coordinates
+        activation: str = "relu"
     ):
+        """
+        Args:
+            n_track: Number of track boundary points per side (left/right)
+            n_waypoints: Number of waypoints to predict
+            d_model: Dimension of the model embeddings
+            nhead: Number of attention heads
+            num_decoder_layers: Number of transformer decoder layers
+            dim_feedforward: Dimension of feedforward network
+            dropout: Dropout probability
+            input_dim: Dimension of input coordinates (x, y)
+            activation: Activation function for transformer layers
+        """
         super().__init__()
-
+        
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-
-        self.query_embed = nn.Embedding(n_waypoints, d_model)
-
+        self.d_model = d_model
+        self.max_lane_points = 2 * n_track  # left + right track boundaries
+        
+        # Learned waypoint query embeddings (latent array in Perceiver terms)
+        self.waypoint_queries = nn.Embedding(n_waypoints, d_model)
+        
+        # Input projection for track boundary points (byte array projection)
+        self.input_projection = nn.Linear(input_dim, d_model)
+        
+        # Positional encoding for track boundary points
+        self.lane_pos_encoding = nn.Parameter(
+            torch.randn(self.max_lane_points, d_model) * 0.02
+        )
+        
+        # Positional encoding for waypoint queries
+        self.waypoint_pos_encoding = nn.Parameter(
+            torch.randn(n_waypoints, d_model) * 0.02
+        )
+        
+        # Transformer decoder layers for cross-attention
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+            batch_first=True
+        )
+        
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=num_decoder_layers
+        )
+        
+        # Output projection to waypoint coordinates
+        self.output_projection = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward // 2, 2)  # x, y coordinates
+        )
+        
+        # Dropout for embeddings
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize model weights."""
+        # Initialize waypoint queries with small random values
+        nn.init.normal_(self.waypoint_queries.weight, std=0.02)
+        
+        # Initialize linear layers
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+    
     def forward(
-        self,
+        self, 
         track_left: torch.Tensor,
         track_right: torch.Tensor,
         **kwargs,
@@ -134,15 +215,58 @@ class TransformerPlanner(nn.Module):
 
         During test time, your model will be called with
         model(track_left=..., track_right=...), so keep the function signature as is.
-
+        
         Args:
-            track_left (torch.Tensor): shape (b, n_track, 2)
-            track_right (torch.Tensor): shape (b, n_track, 2)
-
+            track_left: Left track boundary points, shape (batch_size, n_track, 2)
+            track_right: Right track boundary points, shape (batch_size, n_track, 2)
+        
         Returns:
-            torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
+            waypoints: Predicted waypoints, shape (batch_size, n_waypoints, 2)
         """
-        raise NotImplementedError
+        # Concatenate left and right track boundaries
+        lane_boundaries = torch.cat([track_left, track_right], dim=1)  # (batch, 2*n_track, 2)
+        batch_size, num_points, _ = lane_boundaries.shape
+        
+        # Ensure we don't exceed max_lane_points
+        if num_points > self.max_lane_points:
+            lane_boundaries = lane_boundaries[:, :self.max_lane_points]
+            num_points = self.max_lane_points
+        
+        # Project track boundary points to model dimension (byte array -> embeddings)
+        lane_features = self.input_projection(lane_boundaries)  # (batch, points, d_model)
+        
+        # Add positional encoding to lane features
+        lane_features = lane_features + self.lane_pos_encoding[:num_points].unsqueeze(0)
+        lane_features = self.dropout(lane_features)
+        
+        # Get waypoint query embeddings (latent array)
+        waypoint_indices = torch.arange(self.n_waypoints, device=lane_boundaries.device)
+        waypoint_queries = self.waypoint_queries(waypoint_indices)  # (n_waypoints, d_model)
+        waypoint_queries = waypoint_queries.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, n_waypoints, d_model)
+        
+        # Add positional encoding to waypoint queries
+        waypoint_queries = waypoint_queries + self.waypoint_pos_encoding.unsqueeze(0)
+        waypoint_queries = self.dropout(waypoint_queries)
+        
+        # Create padding mask (no padding for track boundaries - all points are valid)
+        memory_key_padding_mask = torch.zeros(
+            batch_size, num_points, 
+            device=lane_boundaries.device,
+            dtype=torch.bool
+        )
+        
+        # Apply transformer decoder layers (cross-attention)
+        # tgt: waypoint queries, memory: lane features
+        attended_waypoints = self.transformer_decoder(
+            tgt=waypoint_queries,
+            memory=lane_features,
+            memory_key_padding_mask=memory_key_padding_mask
+        )  # (batch, n_waypoints, d_model)
+        
+        # Project to waypoint coordinates
+        waypoints = self.output_projection(attended_waypoints)  # (batch, n_waypoints, 2)
+        
+        return waypoints
 
 
 class CNNPlanner(torch.nn.Module):
