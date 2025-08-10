@@ -190,6 +190,7 @@ class CNNPlanner(torch.nn.Module):
     def __init__(
         self,
         n_waypoints: int = 3,
+        hidden_dim: int = 64,
     ):
         super().__init__()
 
@@ -197,10 +198,80 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
+        # CNN backbone similar to previous homeworks
+        self.backbone = nn.Sequential(
+            # First block: 3 -> 32
+            nn.Conv2d(3, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            # Second block: 32 -> 64
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # Third block: 64 -> 128
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            # Fourth block: 128 -> 256
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            
+            # Fifth block: 256 -> 512
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Global average pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # MLP head to predict waypoints
+        self.head = nn.Sequential(
+            nn.Linear(512, hidden_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, n_waypoints * 2),
+        )
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = image
-        x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
-        raise NotImplementedError
+        # Normalize input
+        x = (image - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
+        
+        # Extract features through CNN backbone
+        x = self.backbone(x)  # (B, 512, H', W')
+        
+        # Global pooling
+        x = self.global_pool(x)  # (B, 512, 1, 1)
+        x = x.flatten(1)  # (B, 512)
+        
+        # Predict waypoints
+        x = self.head(x)  # (B, n_waypoints * 2)
+        
+        # Reshape to waypoints format
+        waypoints = x.reshape(-1, self.n_waypoints, 2)  # (B, n_waypoints, 2)
+        
+        return waypoints
 
 
 MODEL_FACTORY = {
